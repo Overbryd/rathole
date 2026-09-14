@@ -15,12 +15,15 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -43,7 +46,131 @@ const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP serv
 const SOCKET_STREAM_POOL_SIZE: usize = 8; // The number of cached connections for SocketStream services
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
-const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+const INGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressLimit {
+    Global,
+    Peer,
+}
+
+#[derive(Default)]
+struct IngressStats {
+    completed: AtomicU64,
+    failed: AtomicU64,
+    timed_out: AtomicU64,
+    rejected_global: AtomicU64,
+    rejected_peer: AtomicU64,
+}
+
+impl IngressStats {
+    fn record_limit(&self, limit: IngressLimit) {
+        match limit {
+            IngressLimit::Global => self.rejected_global.fetch_add(1, Ordering::Relaxed),
+            IngressLimit::Peer => self.rejected_peer.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn report(&self, active: usize, peers: usize) {
+        let completed = self.completed.swap(0, Ordering::Relaxed);
+        let failed = self.failed.swap(0, Ordering::Relaxed);
+        let timed_out = self.timed_out.swap(0, Ordering::Relaxed);
+        let rejected_global = self.rejected_global.swap(0, Ordering::Relaxed);
+        let rejected_peer = self.rejected_peer.swap(0, Ordering::Relaxed);
+
+        if [completed, failed, timed_out, rejected_global, rejected_peer]
+            .into_iter()
+            .any(|count| count != 0)
+        {
+            info!(
+                target: "rathole::ingress",
+                completed,
+                failed,
+                timed_out,
+                rejected_global,
+                rejected_peer,
+                active,
+                peers,
+                "Ingress handshake activity"
+            );
+        }
+    }
+}
+
+struct IngressLimiter {
+    global: Arc<Semaphore>,
+    max_global: usize,
+    max_per_ip: usize,
+    peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    stats: Arc<IngressStats>,
+}
+
+impl IngressLimiter {
+    fn new(max_global: usize, max_per_ip: usize) -> Result<Self> {
+        if max_global == 0 {
+            bail!("Maximum pending handshakes must be greater than zero");
+        }
+        if max_per_ip == 0 || max_per_ip > max_global {
+            bail!("Maximum pending handshakes per IP must be between one and the global limit");
+        }
+
+        Ok(Self {
+            global: Arc::new(Semaphore::new(max_global)),
+            max_global,
+            max_per_ip,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            stats: Arc::new(IngressStats::default()),
+        })
+    }
+
+    fn try_acquire(&self, ip: IpAddr) -> std::result::Result<IngressPermit, IngressLimit> {
+        let global = match self.global.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.stats.record_limit(IngressLimit::Global);
+                return Err(IngressLimit::Global);
+            }
+        };
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let active = peers.entry(ip).or_default();
+        if *active >= self.max_per_ip {
+            self.stats.record_limit(IngressLimit::Peer);
+            return Err(IngressLimit::Peer);
+        }
+        *active += 1;
+        drop(peers);
+
+        Ok(IngressPermit {
+            _global: global,
+            ip,
+            peers: self.peers.clone(),
+        })
+    }
+
+    fn report(&self) {
+        let active = self.max_global - self.global.available_permits();
+        let peers = self.peers.lock().unwrap_or_else(|e| e.into_inner()).len();
+        self.stats.report(active, peers);
+    }
+}
+
+struct IngressPermit {
+    _global: OwnedSemaphorePermit,
+    ip: IpAddr,
+    peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for IngressPermit {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = peers.get_mut(&self.ip) {
+            *active -= 1;
+            if *active == 0 {
+                peers.remove(&self.ip);
+            }
+        }
+    }
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -110,6 +237,8 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    // Bounds unauthenticated handshakes globally and per source IP
+    ingress: IngressLimiter,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -130,11 +259,16 @@ impl<T: 'static + Transport> Server<T> {
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport, TransportRole::Server)?);
+        let ingress = IngressLimiter::new(
+            config.max_pending_handshakes,
+            config.max_pending_handshakes_per_ip,
+        )?;
         Ok(Server {
             config,
             services,
             control_channels,
             transport,
+            ingress,
         })
     }
 
@@ -158,6 +292,13 @@ impl<T: 'static + Transport> Server<T> {
             max_elapsed_time: None,
             ..Default::default()
         };
+
+        let mut ingress_tasks = JoinSet::new();
+        let mut ingress_report = time::interval_at(
+            time::Instant::now() + INGRESS_REPORT_INTERVAL,
+            INGRESS_REPORT_INTERVAL,
+        );
+        ingress_report.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         // Wait for connections and shutdown signals
         loop {
@@ -186,26 +327,42 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
+                            match self.ingress.try_acquire(addr.ip()) {
+                                Ok(permit) => {
+                                    let transport = self.transport.clone();
+                                    let services = self.services.clone();
+                                    let control_channels = self.control_channels.clone();
+                                    let server_config = self.config.clone();
+                                    let stats = self.ingress.stats.clone();
+                                    let timeout = Duration::from_secs(self.config.handshake_timeout);
+                                    ingress_tasks.spawn(async move {
+                                        let _permit = permit;
+                                        match run_ingress_handshake(
+                                            conn,
+                                            transport,
+                                            services,
+                                            control_channels,
+                                            server_config,
+                                            timeout,
+                                        )
+                                        .await
+                                        {
+                                            IngressOutcome::Completed => {
+                                                stats.completed.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            IngressOutcome::Failed(err) => {
+                                                stats.failed.fetch_add(1, Ordering::Relaxed);
+                                                debug!(error = %err, "Ingress handshake failed");
+                                            }
+                                            IngressOutcome::TimedOut => {
+                                                stats.timed_out.fetch_add(1, Ordering::Relaxed);
+                                                debug!("Ingress handshake timed out");
+                                            }
                                         }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
+                                    }.instrument(info_span!("connection", %addr)));
+                                }
+                                Err(limit) => {
+                                    debug!(?limit, %addr, "Ingress handshake rejected");
                                 }
                             }
                         }
@@ -220,10 +377,21 @@ impl<T: 'static + Transport> Server<T> {
                     if let Some(e) = e {
                         self.handle_hot_reload(e).await;
                     }
+                },
+                _ = ingress_report.tick() => {
+                    self.ingress.report();
+                },
+                result = ingress_tasks.join_next(), if !ingress_tasks.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        error!("Ingress handshake task failed: {err}");
+                    }
                 }
             }
         }
 
+        ingress_tasks.abort_all();
+        while ingress_tasks.join_next().await.is_some() {}
+        self.ingress.report();
         info!("Shutdown");
 
         Ok(())
@@ -250,6 +418,35 @@ impl<T: 'static + Transport> Server<T> {
             },
             ignored => warn!("Ignored {:?} since running as a server", ignored),
         }
+    }
+}
+
+enum IngressOutcome {
+    Completed,
+    Failed(anyhow::Error),
+    TimedOut,
+}
+
+async fn run_ingress_handshake<T: 'static + Transport>(
+    conn: T::RawStream,
+    transport: Arc<T>,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    server_config: Arc<ServerConfig>,
+    timeout: Duration,
+) -> IngressOutcome {
+    let handshake = async {
+        let conn = transport
+            .handshake(conn)
+            .await
+            .with_context(|| "Failed to do transport handshake")?;
+        handle_connection(conn, services, control_channels, server_config).await
+    };
+
+    match time::timeout(timeout, handshake).await {
+        Ok(Ok(())) => IngressOutcome::Completed,
+        Ok(Err(err)) => IngressOutcome::Failed(err),
+        Err(_) => IngressOutcome::TimedOut,
     }
 }
 
@@ -287,7 +484,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
-    info!("Try to handshake a control channel");
+    debug!("Try to handshake a control channel");
 
     T::hint(&conn, SocketOpts::for_control_channel());
 
@@ -329,11 +526,6 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     if session_key != d {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
         bail!("Service {} failed the authentication", service_name);
     } else {
         let mut h = control_channels.write().await;
@@ -390,9 +582,7 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
                 .await
                 .with_context(|| "Data channel for a stale control channel")?;
         }
-        None => {
-            warn!("Data channel has incorrect nonce");
-        }
+        None => bail!("Data channel has incorrect nonce"),
     }
     Ok(())
 }
@@ -927,10 +1117,57 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::io::ErrorKind;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::ToSocketAddrs;
 
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[derive(Debug)]
+    struct SlowFirstTransport {
+        tcp: TcpTransport,
+        handshakes_started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Transport for SlowFirstTransport {
+        type Acceptor = TcpListener;
+        type RawStream = TcpStream;
+        type Stream = TcpStream;
+
+        fn new(config: &crate::config::TransportConfig, role: TransportRole) -> Result<Self> {
+            Ok(Self {
+                tcp: TcpTransport::new(config, role)?,
+                handshakes_started: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        fn hint(conn: &Self::Stream, opts: SocketOpts) {
+            TcpTransport::hint(conn, opts);
+        }
+
+        async fn bind<A: ToSocketAddrs + Send + Sync>(&self, addr: A) -> Result<Self::Acceptor> {
+            self.tcp.bind(addr).await
+        }
+
+        async fn accept(&self, acceptor: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)> {
+            self.tcp.accept(acceptor).await
+        }
+
+        async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
+            if self.handshakes_started.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::future::pending().await
+            } else {
+                Ok(conn)
+            }
+        }
+
+        async fn connect(&self, addr: &crate::transport::AddrMaybeCached) -> Result<Self::Stream> {
+            self.tcp.connect(addr).await
+        }
+    }
 
     fn unused_tcp_addr() -> Result<SocketAddr> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1007,6 +1244,179 @@ mod tests {
             bind_addr: bind_addr.to_string(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn slow_transport_handshake_does_not_block_accepting_connections() -> Result<()> {
+        let server_addr = unused_tcp_addr()?;
+        let mut server = Server::<SlowFirstTransport>::from(ServerConfig {
+            bind_addr: server_addr.to_string(),
+            ..Default::default()
+        })
+        .await?;
+        let handshakes_started = server.transport.handshakes_started.clone();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_update_tx, update_rx) = mpsc::channel(1);
+        let server_task = tokio::spawn(async move { server.run(shutdown_rx, update_rx).await });
+
+        let _slow_connection = time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpStream::connect(server_addr).await {
+                    Ok(connection) => return connection,
+                    Err(_) => time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .context("server listener was not created before the deadline")?;
+
+        time::timeout(CLEANUP_TIMEOUT, async {
+            while handshakes_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("slow handshake did not start before the deadline")?;
+
+        let mut responsive_connection = TcpStream::connect(server_addr).await?;
+        let hello = Hello::ControlChannelHello(
+            protocol::CURRENT_PROTO_VERSION,
+            protocol::digest(b"missing-service"),
+        );
+        responsive_connection
+            .write_all(&bincode::serialize(&hello)?)
+            .await?;
+
+        time::timeout(
+            Duration::from_millis(250),
+            read_hello(&mut responsive_connection),
+        )
+        .await
+        .context("a slow handshake blocked the accept loop")??;
+
+        let _ = shutdown_tx.send(true);
+        time::timeout(CLEANUP_TIMEOUT, server_task)
+            .await
+            .context("server did not shut down before the deadline")???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_handshake_limit_drops_excess_connections() -> Result<()> {
+        let server_addr = unused_tcp_addr()?;
+        let mut server = Server::<SlowFirstTransport>::from(ServerConfig {
+            bind_addr: server_addr.to_string(),
+            max_pending_handshakes: 1,
+            max_pending_handshakes_per_ip: 1,
+            ..Default::default()
+        })
+        .await?;
+        let handshakes_started = server.transport.handshakes_started.clone();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_update_tx, update_rx) = mpsc::channel(1);
+        let server_task = tokio::spawn(async move { server.run(shutdown_rx, update_rx).await });
+
+        let _pending_connection = time::timeout(CLEANUP_TIMEOUT, async {
+            loop {
+                match TcpStream::connect(server_addr).await {
+                    Ok(connection) => return connection,
+                    Err(_) => time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .context("server listener was not created before the deadline")?;
+
+        time::timeout(CLEANUP_TIMEOUT, async {
+            while handshakes_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("pending handshake did not start before the deadline")?;
+
+        let mut rejected_connection = TcpStream::connect(server_addr).await?;
+        let mut byte = [0_u8; 1];
+        let bytes_read = time::timeout(
+            Duration::from_millis(250),
+            rejected_connection.read(&mut byte),
+        )
+        .await
+        .context("excess connection was not rejected promptly")??;
+        assert_eq!(bytes_read, 0);
+        assert_eq!(handshakes_started.load(Ordering::SeqCst), 1);
+
+        let _ = shutdown_tx.send(true);
+        time::timeout(CLEANUP_TIMEOUT, server_task)
+            .await
+            .context("server did not shut down before the deadline")???;
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_limiter_bounds_global_and_per_ip_concurrency() -> Result<()> {
+        let limiter = IngressLimiter::new(2, 1)?;
+        let first_ip = "192.0.2.1".parse()?;
+        let second_ip = "192.0.2.2".parse()?;
+        let third_ip = "192.0.2.3".parse()?;
+
+        let first = limiter
+            .try_acquire(first_ip)
+            .map_err(|limit| anyhow!("unexpected ingress limit: {limit:?}"))?;
+        assert!(matches!(
+            limiter.try_acquire(first_ip),
+            Err(IngressLimit::Peer)
+        ));
+
+        let second = limiter
+            .try_acquire(second_ip)
+            .map_err(|limit| anyhow!("unexpected ingress limit: {limit:?}"))?;
+        assert!(matches!(
+            limiter.try_acquire(third_ip),
+            Err(IngressLimit::Global)
+        ));
+
+        drop(first);
+        let replacement = limiter
+            .try_acquire(first_ip)
+            .map_err(|limit| anyhow!("unexpected ingress limit: {limit:?}"))?;
+        drop(replacement);
+        drop(second);
+
+        assert_eq!(limiter.global.available_permits(), 2);
+        assert!(limiter
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_includes_protocol_hello() -> Result<()> {
+        let (server_conn, mut client_conn) = connected_tcp_pair().await?;
+        let transport = Arc::new(TcpTransport::new(
+            &Default::default(),
+            TransportRole::Server,
+        )?);
+
+        let outcome = run_ingress_handshake(
+            server_conn,
+            transport,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(ControlChannelMap::new())),
+            Arc::new(ServerConfig::default()),
+            Duration::from_millis(25),
+        )
+        .await;
+
+        assert!(matches!(outcome, IngressOutcome::TimedOut));
+        let mut byte = [0_u8; 1];
+        let bytes_read = time::timeout(CLEANUP_TIMEOUT, client_conn.read(&mut byte))
+            .await
+            .context("timed-out connection was not closed before the deadline")??;
+        assert_eq!(bytes_read, 0);
+        Ok(())
     }
 
     #[tokio::test]

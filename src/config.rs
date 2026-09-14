@@ -14,6 +14,11 @@ use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAU
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 
+/// Server ingress protection
+const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
+const DEFAULT_MAX_PENDING_HANDSHAKES_PER_IP: usize = 64;
+
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
@@ -257,7 +262,19 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+fn default_handshake_timeout() -> u64 {
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS
+}
+
+fn default_max_pending_handshakes() -> usize {
+    DEFAULT_MAX_PENDING_HANDSHAKES
+}
+
+fn default_max_pending_handshakes_per_ip() -> usize {
+    DEFAULT_MAX_PENDING_HANDSHAKES_PER_IP
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
@@ -267,6 +284,27 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout: u64,
+    #[serde(default = "default_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    #[serde(default = "default_max_pending_handshakes_per_ip")]
+    pub max_pending_handshakes_per_ip: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: String::new(),
+            default_token: None,
+            services: HashMap::new(),
+            transport: TransportConfig::default(),
+            heartbeat_interval: default_heartbeat_interval(),
+            handshake_timeout: default_handshake_timeout(),
+            max_pending_handshakes: default_max_pending_handshakes(),
+            max_pending_handshakes_per_ip: default_max_pending_handshakes_per_ip(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -296,6 +334,21 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+        if server.handshake_timeout == 0 {
+            bail!("`server.handshake_timeout` must be greater than zero");
+        }
+        if server.max_pending_handshakes == 0 {
+            bail!("`server.max_pending_handshakes` must be greater than zero");
+        }
+        if server.max_pending_handshakes_per_ip == 0 {
+            bail!("`server.max_pending_handshakes_per_ip` must be greater than zero");
+        }
+        if server.max_pending_handshakes_per_ip > server.max_pending_handshakes {
+            bail!(
+                "`server.max_pending_handshakes_per_ip` must not exceed `server.max_pending_handshakes`"
+            );
+        }
+
         // Validate services
         for (name, s) in &mut server.services {
             s.name = name.clone();
@@ -490,6 +543,50 @@ mod tests {
         let insecure = websocket_transport(false, None);
         assert!(Config::validate_transport_config(&insecure, false).is_ok());
         assert!(Config::validate_transport_config(&insecure, true).is_ok());
+    }
+
+    #[test]
+    fn test_server_ingress_defaults_and_validation() -> Result<()> {
+        let config = Config::from_str(
+            r#"
+                [server]
+                bind_addr = "127.0.0.1:2333"
+
+                [server.services.test]
+                bind_addr = "127.0.0.1:8080"
+                token = "test-token"
+            "#,
+        )?;
+        let server = config.server.expect("server config is present");
+        assert_eq!(server.handshake_timeout, DEFAULT_HANDSHAKE_TIMEOUT_SECS);
+        assert_eq!(
+            server.max_pending_handshakes,
+            DEFAULT_MAX_PENDING_HANDSHAKES
+        );
+        assert_eq!(
+            server.max_pending_handshakes_per_ip,
+            DEFAULT_MAX_PENDING_HANDSHAKES_PER_IP
+        );
+
+        let mut invalid = ServerConfig {
+            handshake_timeout: 0,
+            ..Default::default()
+        };
+        assert!(Config::validate_server_config(&mut invalid).is_err());
+
+        invalid = ServerConfig {
+            max_pending_handshakes: 0,
+            ..Default::default()
+        };
+        assert!(Config::validate_server_config(&mut invalid).is_err());
+
+        invalid = ServerConfig {
+            max_pending_handshakes: 4,
+            max_pending_handshakes_per_ip: 5,
+            ..Default::default()
+        };
+        assert!(Config::validate_server_config(&mut invalid).is_err());
+        Ok(())
     }
 
     #[test]

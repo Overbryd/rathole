@@ -145,6 +145,12 @@ local_addr = "127.0.0.1:1082"
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+handshake_timeout = 5 # Optional. Deadline for the transport handshake and rathole authentication. Default: 5 seconds
+max_pending_handshakes = 256 # Optional. Global concurrent unauthenticated handshake limit. Default: 256
+max_pending_handshakes_per_ip = 64 # Optional. Concurrent unauthenticated handshake limit per peer IP. Default: 64
+
+# The per-IP limit uses the socket peer address. When running behind a load balancer,
+# preserve the original client IP or size this limit for the load balancer's shared address.
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"
@@ -191,6 +197,11 @@ RUST_LOG=error ./rathole config.toml
 will run `rathole` with only error level logging.
 
 If `RUST_LOG` is not present, the default logging level is `info`.
+
+The server emits a structured `rathole::ingress` summary once per minute when
+handshake activity occurs. `failed`, `timed_out`, `rejected_global`, and
+`rejected_peer` help detect malformed traffic, slow peers, and saturated limits
+without logging every unauthenticated connection.
 
 ### Tuning
 
